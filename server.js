@@ -143,7 +143,7 @@ ${eid ? `fbq('track','Purchase',{value:${val},currency:'UAH'},{eventID:'${eid}'}
         body: JSON.stringify({
           amount, ccy: 980,
           merchantPaymInfo: { reference: `bot-${niche}-${Date.now()}`, destination: `SL-CLAW: AI-продавец (ниша ${niche}, тариф ${tier})` },
-          redirectUrl: `${BASE}/success`,
+          redirectUrl: `${SITE}/thanks.html`,
           webHookUrl: `${BASE}/webhook`,
         }),
       });
@@ -154,7 +154,10 @@ ${eid ? `fbq('track','Purchase',{value:${val},currency:'UAH'},{eventID:'${eid}'}
           ORDERS.set(d.invoiceId, { fbp, fbc, fbclid, email, amount: amount / 100, niche, tier, ts: Date.now() });
         }
         const headers = { Location: d.pageUrl };
-        if (d.invoiceId) headers['Set-Cookie'] = `slc_inv=${encodeURIComponent(d.invoiceId)}; Domain=.sl-claw.tech; Path=/; Max-Age=7200; SameSite=Lax; Secure`;
+        if (d.invoiceId) headers['Set-Cookie'] = [
+          `slc_inv=${encodeURIComponent(d.invoiceId)}; Domain=.sl-claw.tech; Path=/; Max-Age=7200; SameSite=Lax; Secure`,
+          `slc_val=${amount / 100}; Domain=.sl-claw.tech; Path=/; Max-Age=7200; SameSite=Lax; Secure`,
+        ];
         res.writeHead(302, headers); return res.end();
       }
       res.writeHead(502, H); return res.end(page('<h2>Не удалось создать счёт</h2><pre>' + JSON.stringify(d) + '</pre>'));
