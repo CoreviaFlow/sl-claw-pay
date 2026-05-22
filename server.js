@@ -2,8 +2,12 @@
 // Токен Monobank живёт ТОЛЬКО здесь (env), в браузер не попадает.
 // + FB Purchase tracking: server-side CAPI (authoritative) + browser Pixel на /success.
 const http = require('http');
+const crypto = require('crypto');
 
 const TOKEN = process.env.MONOBANK_TOKEN || '';
+// CRM «It цифра» (corevia-crm): лиды с сайта форвардятся сюда с HMAC-подписью.
+const CRM_URL = process.env.CRM_WEBHOOK_URL || 'https://crm.coreviaflow.space/api/webhooks/daryna/lead-sync';
+const CRM_SECRET = process.env.CRM_WEBHOOK_SECRET || '';
 const BASE  = process.env.BASE_URL  || 'https://pay.sl-claw.tech';
 const SITE  = process.env.SITE_URL  || 'https://sl-claw.tech';
 // FB / CAPI
@@ -82,6 +86,39 @@ const server = http.createServer(async (req, res) => {
   const H = { 'content-type': 'text/html; charset=utf-8' };
 
   if (u.pathname === '/health') { res.writeHead(200); return res.end('ok'); }
+
+  // Лид с сайта (checkout) → CRM «It цифра»
+  if (u.pathname === '/lead') {
+    res.setHeader('Access-Control-Allow-Origin', SITE);
+    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
+    let b = ''; req.on('data', c => b += c);
+    req.on('end', async () => {
+      try {
+        const lead = JSON.parse(b || '{}');
+        const niche = String(lead.niche || '').slice(0, 80);
+        const payload = {
+          name: 'Сайт SL-CLAW: ' + (niche || 'заявка'),
+          email: String(lead.email || '').slice(0, 160),
+          phone: String(lead.phone || '').slice(0, 40),
+          tier: String(lead.tier || '').slice(0, 20),
+          message: `Заявка з checkout sl-claw.tech. Ніша: ${niche}, тариф: ${lead.tier || ''}, ціна: ${lead.price || ''}, мова: ${lead.lang || ''}. URL: ${lead.url || ''}`,
+        };
+        console.log('LEAD:', JSON.stringify(payload));
+        if (CRM_URL && CRM_SECRET) {
+          const body = JSON.stringify(payload);
+          const sig = crypto.createHmac('sha256', CRM_SECRET).update(body).digest('hex');
+          try {
+            const r = await fetch(CRM_URL, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Daryna-Signature': sig }, body });
+            console.log('LEAD→CRM', r.status);
+          } catch (e) { console.log('LEAD→CRM err', e.message); }
+        }
+        res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"ok":true}');
+      } catch (e) { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"ok":false}'); }
+    });
+    return;
+  }
 
   if (u.pathname === '/success') {
     // invoiceId з cookie (виставлений у /create) — для браузерного Pixel Purchase з дедупом.
