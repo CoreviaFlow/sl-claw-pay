@@ -98,11 +98,14 @@ const server = http.createServer(async (req, res) => {
       try {
         const lead = JSON.parse(b || '{}');
         const niche = String(lead.niche || '').slice(0, 80);
+        const phoneDigits = String(lead.phone || '').replace(/\D/g, '');
         const payload = {
+          chat_id: Number(phoneDigits) || Date.now(),   // CRM ключует контакт по chat_id (веб-лид → телефон)
           name: 'Сайт SL-CLAW: ' + (niche || 'заявка'),
           email: String(lead.email || '').slice(0, 160),
           phone: String(lead.phone || '').slice(0, 40),
           tier: String(lead.tier || '').slice(0, 20),
+          source: 'website',
           message: `Заявка з checkout sl-claw.tech. Ніша: ${niche}, тариф: ${lead.tier || ''}, ціна: ${lead.price || ''}, мова: ${lead.lang || ''}. URL: ${lead.url || ''}`,
         };
         console.log('LEAD:', JSON.stringify(payload));
