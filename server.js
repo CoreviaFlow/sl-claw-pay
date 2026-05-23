@@ -14,15 +14,16 @@ const SITE  = process.env.SITE_URL  || 'https://sl-claw.tech';
 const CAPI_URL      = process.env.CAPI_URL      || 'https://events.coreviaflow.space/v1/track';
 const EVENTS_SECRET = process.env.EVENTS_SECRET || '';
 const PIXEL_ID      = process.env.FACEBOOK_PIXEL_ID || '1485718672417519';
-// Цены по тарифам в ГРИВНАХ (гипотеза — поменять под реальные). UAH.
+// Цены по тарифам в ДОЛЛАРАХ (USD). Счёт выставляется в USD (ccy=840),
+// конвертацию в валюту карты делает банк по своему курсу.
 const PRICES = {
-  lite: +(process.env.PRICE_LITE || 3990),
-  std:  +(process.env.PRICE_STD  || 7990),
-  pro:  +(process.env.PRICE_PRO  || 15990),
+  lite: +(process.env.PRICE_LITE || 249),
+  std:  +(process.env.PRICE_STD  || 449),
+  pro:  +(process.env.PRICE_PRO  || 499),
 };
 const ALIAS = { Lite:'lite', Standard:'std', Std:'std', Pro:'pro', lite:'lite', std:'std', pro:'pro' };
 
-// invoiceId → { fbp, fbc, fbclid, email, amount(UAH), niche, tier, ts }
+// invoiceId → { fbp, fbc, fbclid, email, amount(USD), niche, tier, ts }
 // In-memory (інвойси живуть хвилини; при рестарті in-flight втрачає атрибуцію — допустимо для MVP).
 const ORDERS = new Map();
 // захист від подвійного Purchase по одному інвойсу
@@ -54,8 +55,8 @@ async function firePurchaseCAPI(order, invoiceId) {
       fbp: order.fbp || undefined,
       fbc: order.fbc || undefined,
       custom_data: {
-        value: order.amount,                     // UAH
-        currency: 'UAH',
+        value: order.amount,                     // USD
+        currency: 'USD',
         content_type: 'product',
         content_ids: [order.niche || order.tier],
         content_category: order.tier,
@@ -134,7 +135,7 @@ const server = http.createServer(async (req, res) => {
 <script>
 !function(f,b,e,v,n,t,s){if(f.fbq)return;n=f.fbq=function(){n.callMethod?n.callMethod.apply(n,arguments):n.queue.push(arguments)};if(!f._fbq)f._fbq=n;n.push=n;n.loaded=!0;n.version='2.0';n.queue=[];t=b.createElement(e);t.async=!0;t.src=v;s=b.getElementsByTagName(e)[0];s.parentNode.insertBefore(t,s)}(window,document,'script','https://connect.facebook.net/en_US/fbevents.js');
 fbq('init','${PIXEL_ID}');fbq('track','PageView');
-${eid ? `fbq('track','Purchase',{value:${val},currency:'UAH'},{eventID:'${eid}'});` : ''}
+${eid ? `fbq('track','Purchase',{value:${val},currency:'USD'},{eventID:'${eid}'});` : ''}
 </script>`;
     res.writeHead(200, H);
     return res.end(`<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">${pixelSnippet}`
@@ -169,7 +170,7 @@ ${eid ? `fbq('track','Purchase',{value:${val},currency:'UAH'},{eventID:'${eid}'}
   if (u.pathname === '/create') {
     const niche = (u.searchParams.get('niche') || 'bot').replace(/[^a-z0-9-]/gi, '').slice(0, 60);
     const tier  = ALIAS[u.searchParams.get('tier')] || 'std';
-    const amount = (PRICES[tier] || PRICES.std) * 100; // копейки
+    const amount = (PRICES[tier] || PRICES.std) * 100; // центы USD
     // FB attribution params (з checkout)
     const fbp = (u.searchParams.get('fbp') || '').slice(0, 120);
     const fbc = (u.searchParams.get('fbc') || '').slice(0, 200);
@@ -181,7 +182,7 @@ ${eid ? `fbq('track','Purchase',{value:${val},currency:'UAH'},{eventID:'${eid}'}
         method: 'POST',
         headers: { 'X-Token': TOKEN, 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          amount, ccy: 980,
+          amount, ccy: 840,
           merchantPaymInfo: { reference: `bot-${niche}-${Date.now()}`, destination: `SL-CLAW: AI-продавец (ниша ${niche}, тариф ${tier})` },
           redirectUrl: `${SITE}/thanks.html`,
           webHookUrl: `${BASE}/webhook`,
