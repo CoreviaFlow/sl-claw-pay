@@ -49,6 +49,7 @@ async function firePurchaseCAPI(order, invoiceId) {
     const body = {
       event_name: 'Purchase',
       event_id: 'purchase_' + invoiceId,        // дедуп з браузерним Pixel
+      pixel_id: PIXEL_ID,                        // multi-pixel: роутимо на sl-claw pixel (не дефолтний courses)
       event_source_url: `${SITE}/checkout.html`,
       action_source: 'website',
       email: order.email || undefined,
@@ -58,7 +59,7 @@ async function firePurchaseCAPI(order, invoiceId) {
         value: order.amount,                     // USD
         currency: 'USD',
         content_type: 'product',
-        content_ids: [order.niche || order.tier],
+        content_ids: [order.niche || order.tier].filter(Boolean),
         content_category: order.tier,
         order_id: invoiceId,
       },
@@ -158,9 +159,20 @@ ${eid ? `fbq('track','Purchase',{value:${val},currency:'USD'},{eventID:'${eid}'}
         const status = (st && st.status) || data.status;
         if (status !== 'success') { console.log('webhook status not success:', status); return; }
         FIRED.add(invoiceId);
-        const order = ORDERS.get(invoiceId) || {
-          amount: st ? (st.amount / 100) : undefined, tier: 'std', niche: 'bot', ts: Date.now(),
-        };
+        // ORDERS промах (рестарт контейнера) → реконструюємо з Monobank invoice,
+        // а НЕ підставляємо фейкові 'std'/'bot'. reference = bot-{niche}-{ts}.
+        let order = ORDERS.get(invoiceId);
+        if (!order) {
+          const ref = (st && st.reference) || '';
+          const m = ref.match(/^bot-(.+)-\d+$/);
+          order = {
+            amount: st ? (st.amount / 100) : undefined,
+            niche: m ? m[1] : undefined,
+            tier: undefined,
+            ts: Date.now(),
+          };
+          console.log('webhook ORDERS-miss → reconstruct from reference:', ref, '→ niche:', order.niche);
+        }
         await firePurchaseCAPI(order, invoiceId);
       } catch (e) { console.error('webhook parse error:', e.message); }
     });
