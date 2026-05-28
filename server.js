@@ -101,10 +101,18 @@ const server = http.createServer(async (req, res) => {
         const lead = JSON.parse(b || '{}');
         const niche = String(lead.niche || '').slice(0, 80);
         const phoneDigits = String(lead.phone || '').replace(/\D/g, '');
+        const email = String(lead.email || '').trim().slice(0, 160);
+        // Reject empty leads: real submissions from checkout.html always have email + phone.
+        // Empty body means: bot crawler, manual curl, or broken form. Don't pollute CRM.
+        if (!email && phoneDigits.length < 7) {
+          console.log('LEAD rejected (empty email + phone)');
+          res.writeHead(400, { 'content-type': 'application/json' });
+          return res.end('{"ok":false,"reason":"empty_lead"}');
+        }
         const payload = {
           chat_id: Number(phoneDigits) || Date.now(),   // CRM ключует контакт по chat_id (веб-лид → телефон)
           name: 'Сайт SL-CLAW: ' + (niche || 'заявка'),
-          email: String(lead.email || '').slice(0, 160),
+          email: email,
           phone: String(lead.phone || '').slice(0, 40),
           tier: String(lead.tier || '').slice(0, 20),
           source: 'website',
