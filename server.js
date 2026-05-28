@@ -42,6 +42,34 @@ function sha256Lower(v) {
   return require('crypto').createHash('sha256').update(String(v).trim().toLowerCase()).digest('hex');
 }
 
+// ── Rate limiter для /lead (защита от bot-crawlers) ──────────────────
+// In-memory sliding window: max 5 запросов на IP в 15-минутном окне.
+// Достаточно для legit user-flow (один checkout = 1 lead), блокирует burst-боты.
+const LEAD_RATE = new Map(); // ip → [timestamps]
+const LEAD_WINDOW_MS = 15 * 60 * 1000;
+const LEAD_LIMIT = 5;
+function leadRateExceeded(ip) {
+  const now = Date.now();
+  const arr = (LEAD_RATE.get(ip) || []).filter(t => now - t < LEAD_WINDOW_MS);
+  if (arr.length >= LEAD_LIMIT) { LEAD_RATE.set(ip, arr); return true; }
+  arr.push(now);
+  LEAD_RATE.set(ip, arr);
+  return false;
+}
+// GC: чистим устаревшие IPs раз в час
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, arr] of LEAD_RATE) {
+    const filtered = arr.filter(t => now - t < LEAD_WINDOW_MS);
+    if (filtered.length === 0) LEAD_RATE.delete(ip);
+    else LEAD_RATE.set(ip, filtered);
+  }
+}, 3600 * 1000).unref?.();
+function getClientIP(req) {
+  const xff = (req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  return xff || req.socket?.remoteAddress || 'unknown';
+}
+
 // Server-side Purchase у Meta CAPI (через наш proxy).
 async function firePurchaseCAPI(order, invoiceId) {
   if (!EVENTS_SECRET) { console.log('CAPI skip: no EVENTS_SECRET'); return; }
@@ -53,6 +81,7 @@ async function firePurchaseCAPI(order, invoiceId) {
       event_source_url: `${SITE}/checkout.html`,
       action_source: 'website',
       email: order.email || undefined,
+      phone: order.phone || undefined,
       fbp: order.fbp || undefined,
       fbc: order.fbc || undefined,
       custom_data: {
@@ -95,6 +124,13 @@ const server = http.createServer(async (req, res) => {
     res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
     if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
+    // Rate limit: bot-crawler protection (5 req/15min per IP).
+    const ip = getClientIP(req);
+    if (leadRateExceeded(ip)) {
+      console.log('LEAD rate-limited:', ip);
+      res.writeHead(429, { 'content-type': 'application/json', 'Retry-After': '900' });
+      return res.end('{"ok":false,"reason":"rate_limited"}');
+    }
     let b = ''; req.on('data', c => b += c);
     req.on('end', async () => {
       try {
@@ -196,6 +232,8 @@ ${eid ? `fbq('track','Purchase',{value:${val},currency:'USD'},{eventID:'${eid}'}
     const fbc = (u.searchParams.get('fbc') || '').slice(0, 200);
     const fbclid = (u.searchParams.get('fbclid') || '').slice(0, 120);
     const email = (u.searchParams.get('email') || '').slice(0, 160);
+    // Phone (E.164 from intl-tel-input на checkout). Идёт в ORDERS для CAPI ph-attribution.
+    const phone = (u.searchParams.get('phone') || '').slice(0, 40);
     if (!TOKEN) { res.writeHead(500, H); return res.end(page('<h2>Оплата не настроена</h2><p>MONOBANK_TOKEN не задан.</p>')); }
     try {
       const r = await fetch('https://api.monobank.ua/api/merchant/invoice/create', {
@@ -212,7 +250,7 @@ ${eid ? `fbq('track','Purchase',{value:${val},currency:'USD'},{eventID:'${eid}'}
       if (d.pageUrl) {
         // зберігаємо атрибуцію для server-side Purchase + ставимо cookie для browser Purchase
         if (d.invoiceId) {
-          ORDERS.set(d.invoiceId, { fbp, fbc, fbclid, email, amount: amount / 100, niche, tier, ts: Date.now() });
+          ORDERS.set(d.invoiceId, { fbp, fbc, fbclid, email, phone, amount: amount / 100, niche, tier, ts: Date.now() });
         }
         const headers = { Location: d.pageUrl };
         if (d.invoiceId) headers['Set-Cookie'] = [
