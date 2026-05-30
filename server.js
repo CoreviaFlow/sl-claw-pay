@@ -10,6 +10,41 @@ const CRM_URL = process.env.CRM_WEBHOOK_URL || 'https://crm.coreviaflow.space/ap
 const CRM_SECRET = process.env.CRM_WEBHOOK_SECRET || '';
 const BASE  = process.env.BASE_URL  || 'https://pay.sl-claw.tech';
 const SITE  = process.env.SITE_URL  || 'https://sl-claw.tech';
+// SL-CLAW access (robot-vidavalka): тригер fork + welcome email після успішного платежу
+const ACCESS_URL  = process.env.SL_CLAW_ACCESS_URL  || 'https://access.sl-claw.tech';
+const ACCESS_HMAC = process.env.SL_CLAW_ACCESS_HMAC_SECRET || '';
+// pay-service tiers (lite/std/pro) → access tiers (trial/solo/business/enterprise)
+const TIER_MAP = { lite: 'solo', std: 'business', pro: 'enterprise' };
+
+async function triggerProvision(order, invoiceId) {
+  if (!ACCESS_HMAC) { console.log('access provision skip: no SL_CLAW_ACCESS_HMAC_SECRET'); return; }
+  if (!order.niche) { console.log('access provision skip: no niche'); return; }
+  const email = (order.email || '').trim().toLowerCase();
+  if (!email) { console.log('access provision skip: no email'); return; }
+  const firstName = email.split('@')[0].replace(/[._-]/g, ' ').replace(/\b\w/g, c => c.toUpperCase()).slice(0, 100) || 'Customer';
+  const accessTier = TIER_MAP[order.tier] || 'trial';
+  const payload = JSON.stringify({
+    email,
+    first_name: firstName,
+    slug: order.niche,
+    tier: accessTier,
+    price_usd: order.amount || 0,
+    payment_id: String(invoiceId),
+    autobilling_consent: true,
+    lang: 'ru',
+  });
+  const sig = crypto.createHmac('sha256', ACCESS_HMAC).update(payload).digest('hex');
+  try {
+    const r = await fetch(`${ACCESS_URL}/provision`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-access-signature': `sha256=${sig}` },
+      body: payload,
+    });
+    const txt = await r.text();
+    if (!r.ok) { console.error('access provision non-OK:', r.status, txt.slice(0, 300)); return; }
+    console.log('access provision OK:', txt.slice(0, 200));
+  } catch (e) { console.error('access provision failed:', e.message); }
+}
 // FB / CAPI
 const CAPI_URL      = process.env.CAPI_URL      || 'https://events.coreviaflow.space/v1/track';
 const EVENTS_SECRET = process.env.EVENTS_SECRET || '';
@@ -218,6 +253,8 @@ ${eid ? `fbq('track','Purchase',{value:${val},currency:'USD'},{eventID:'${eid}'}
           console.log('webhook ORDERS-miss → reconstruct from reference:', ref, '→ niche:', order.niche);
         }
         await firePurchaseCAPI(order, invoiceId);
+        // SL-CLAW access provision: fork + welcome email + CRM card + Telegram alert
+        await triggerProvision(order, invoiceId);
       } catch (e) { console.error('webhook parse error:', e.message); }
     });
     return;
