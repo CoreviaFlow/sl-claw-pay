@@ -3,6 +3,8 @@
 // + FB Purchase tracking: server-side CAPI (authoritative) + browser Pixel на /success.
 const http = require('http');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
 const TOKEN = process.env.MONOBANK_TOKEN || '';
 // CRM «It цифра» (corevia-crm): лиды с сайта форвардятся сюда с HMAC-подписью.
@@ -15,6 +17,123 @@ const ACCESS_URL  = process.env.SL_CLAW_ACCESS_URL  || 'https://access.sl-claw.t
 const ACCESS_HMAC = process.env.SL_CLAW_ACCESS_HMAC_SECRET || '';
 // pay-service tiers (lite/std/pro) → access tiers (trial/solo/business/enterprise)
 const TIER_MAP = { lite: 'solo', std: 'business', pro: 'enterprise' };
+
+// ── Fix 3: Telegram alert to founder ────────────────────────────────────────
+const TG_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+const ADMIN_IDS_RAW = process.env.ADMIN_TELEGRAM_USER_IDS || '';
+const ADMIN_IDS = ADMIN_IDS_RAW.split(',').map(s => s.trim()).filter(Boolean);
+
+async function alertFounder(text) {
+  if (!TG_BOT_TOKEN || ADMIN_IDS.length === 0) {
+    console.warn('[alert] TELEGRAM_BOT_TOKEN or ADMIN_TELEGRAM_USER_IDS not set — alert skipped:', text);
+    return;
+  }
+  for (const chatId of ADMIN_IDS) {
+    try {
+      await fetch(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML' }),
+      });
+    } catch (e) {
+      console.error('[alert] Telegram send failed:', e.message);
+    }
+  }
+}
+
+// ── Fix 1: Monobank X-Sign ECDSA-SHA256 verification ────────────────────────
+// Pubkey кэшируется 24h (не постоянно — безопасность: ротация ключей Monobank).
+let _pubKeyB64 = null;
+let _pubKeyFetchedAt = 0;
+const PUBKEY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+async function fetchMonoPubKey() {
+  const now = Date.now();
+  if (_pubKeyB64 && (now - _pubKeyFetchedAt) < PUBKEY_TTL_MS) return _pubKeyB64;
+  try {
+    const r = await fetch('https://api.monobank.ua/api/merchant/pubkey', {
+      headers: { 'X-Token': TOKEN },
+    });
+    if (!r.ok) { console.error('[pubkey] fetch failed HTTP', r.status); return null; }
+    const data = await r.json();
+    _pubKeyB64 = data.key || null;
+    _pubKeyFetchedAt = now;
+    return _pubKeyB64;
+  } catch (e) {
+    console.error('[pubkey] fetch error:', e.message);
+    return null;
+  }
+}
+
+async function verifyMonobankSignature(rawBody, xSign) {
+  if (!xSign) return false;
+  const pubB64 = await fetchMonoPubKey();
+  if (!pubB64) return false;
+  try {
+    const keyPem = Buffer.from(pubB64, 'base64').toString('utf8');
+    const publicKey = crypto.createPublicKey(keyPem);
+    const verify = crypto.createVerify('SHA256');
+    verify.update(rawBody);
+    verify.end();
+    return verify.verify(publicKey, Buffer.from(xSign, 'base64'));
+  } catch (e) {
+    console.error('[verify] signature verify error:', e.message);
+    return false;
+  }
+}
+
+// ── Fix 2: FIRED Set persist via flat file ───────────────────────────────────
+// Volume mount в Coolify: /data (persist across restarts).
+const FIRED_FILE = path.join(process.env.FIRED_FILE_PATH || '/data', 'fired_invoices.json');
+const FIRED_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+// { invoiceId: timestamp_ms }
+let FIRED_MAP = {};
+
+function firedLoad() {
+  try {
+    const dir = path.dirname(FIRED_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    if (fs.existsSync(FIRED_FILE)) {
+      FIRED_MAP = JSON.parse(fs.readFileSync(FIRED_FILE, 'utf8'));
+      console.log('[fired] loaded', Object.keys(FIRED_MAP).length, 'entries from disk');
+    }
+  } catch (e) {
+    console.error('[fired] load error:', e.message);
+    FIRED_MAP = {};
+  }
+}
+
+function firedSave() {
+  try {
+    fs.writeFileSync(FIRED_FILE, JSON.stringify(FIRED_MAP), 'utf8');
+  } catch (e) {
+    console.error('[fired] save error:', e.message);
+  }
+}
+
+function firedHas(invoiceId) {
+  return !!FIRED_MAP[invoiceId];
+}
+
+function firedAdd(invoiceId) {
+  FIRED_MAP[invoiceId] = Date.now();
+  firedSave();
+}
+
+function firedCleanup() {
+  const cutoff = Date.now() - FIRED_TTL_MS;
+  let removed = 0;
+  for (const [k, ts] of Object.entries(FIRED_MAP)) {
+    if (ts < cutoff) { delete FIRED_MAP[k]; removed++; }
+  }
+  if (removed > 0) { firedSave(); console.log('[fired] cleanup removed', removed, 'old entries'); }
+}
+
+// Загружаем при старте
+firedLoad();
+// Чистка раз в час на каждом poll-цикле
+setInterval(firedCleanup, 60 * 60 * 1000).unref?.();
 
 async function triggerProvision(order, invoiceId) {
   if (!ACCESS_HMAC) { console.log('access provision skip: no SL_CLAW_ACCESS_HMAC_SECRET'); return; }
@@ -41,9 +160,18 @@ async function triggerProvision(order, invoiceId) {
       body: payload,
     });
     const txt = await r.text();
-    if (!r.ok) { console.error('access provision non-OK:', r.status, txt.slice(0, 300)); return; }
+    if (!r.ok) {
+      const msg = `🚨 Pay-service ALERT\naccess /provision non-OK: HTTP ${r.status}\nReason: ${txt.slice(0, 200)}\nInvoice: ${invoiceId}\nNiche: ${order.niche || '—'}`;
+      console.error('access provision non-OK:', r.status, txt.slice(0, 300));
+      await alertFounder(msg);
+      return;
+    }
     console.log('access provision OK:', txt.slice(0, 200));
-  } catch (e) { console.error('access provision failed:', e.message); }
+  } catch (e) {
+    const msg = `🚨 Pay-service ALERT\naccess /provision exception: ${e.message}\nInvoice: ${invoiceId}\nNiche: ${order.niche || '—'}`;
+    console.error('access provision failed:', e.message);
+    await alertFounder(msg);
+  }
 }
 // FB / CAPI
 const CAPI_URL      = process.env.CAPI_URL      || 'https://events.coreviaflow.space/v1/track';
@@ -61,8 +189,6 @@ const ALIAS = { Lite:'lite', Standard:'std', Std:'std', Pro:'pro', lite:'lite', 
 // invoiceId → { fbp, fbc, fbclid, email, amount(USD), niche, tier, ts }
 // In-memory (інвойси живуть хвилини; при рестарті in-flight втрачає атрибуцію — допустимо для MVP).
 const ORDERS = new Map();
-// захист від подвійного Purchase по одному інвойсу
-const FIRED = new Set();
 function gcOrders() {
   const now = Date.now();
   for (const [k, v] of ORDERS) if (now - v.ts > 2 * 3600 * 1000) ORDERS.delete(k);
@@ -143,8 +269,20 @@ async function monoStatus(invoiceId) {
     const r = await fetch('https://api.monobank.ua/api/merchant/invoice/status?invoiceId=' + encodeURIComponent(invoiceId), {
       headers: { 'X-Token': TOKEN },
     });
+    if (!r.ok) {
+      const txt = await r.text();
+      const msg = `🚨 Pay-service ALERT\nmonoStatus call failed: HTTP ${r.status}\nInvoice: ${invoiceId}\nNiche: —\nBody: ${txt.slice(0, 200)}`;
+      console.error('[monoStatus] non-OK:', r.status, txt.slice(0, 200));
+      await alertFounder(msg);
+      return null;
+    }
     return await r.json();
-  } catch (e) { return null; }
+  } catch (e) {
+    const msg = `🚨 Pay-service ALERT\nmonoStatus exception: ${e.message}\nInvoice: ${invoiceId}\nNiche: —`;
+    console.error('[monoStatus] error:', e.message);
+    await alertFounder(msg);
+    return null;
+  }
 }
 
 const server = http.createServer(async (req, res) => {
@@ -224,20 +362,39 @@ ${eid ? `fbq('track','Purchase',{value:${val},currency:'USD'},{eventID:'${eid}'}
   }
 
   if (u.pathname === '/webhook') {
-    let b = ''; req.on('data', c => b += c);
+    // Зчитуємо raw body ДО відповіді — потрібен для X-Sign верифікації
+    const chunks = [];
+    req.on('data', c => chunks.push(c));
     req.on('end', async () => {
-      console.log('MONO WEBHOOK:', b.slice(0, 600));
+      const rawBody = Buffer.concat(chunks).toString('utf8');
+      const xSign = req.headers['x-sign'] || null;
+
+      // Fix 1: X-Sign ECDSA verification
+      const sigValid = await verifyMonobankSignature(rawBody, xSign);
+      if (!sigValid) {
+        console.warn('[webhook] invalid X-Sign from', getClientIP(req), '— rejecting');
+        // Alert тільки якщо запит схожий на атаку (є тіло але підпис невалідний)
+        if (rawBody.length > 0) {
+          await alertFounder(
+            `🚨 Pay-service ALERT\nX-Sign invalid (suspected webhook spoof)\nIP: ${getClientIP(req)}\nBody preview: ${rawBody.slice(0, 150)}`
+          );
+        }
+        res.writeHead(400, { 'content-type': 'application/json' });
+        return res.end('{"ok":false,"reason":"invalid_signature"}');
+      }
+
+      console.log('MONO WEBHOOK (sig OK):', rawBody.slice(0, 600));
       res.writeHead(200); res.end('ok');
       // обробляємо асинхронно після відповіді
       try {
-        const data = JSON.parse(b || '{}');
+        const data = JSON.parse(rawBody || '{}');
         const invoiceId = data.invoiceId;
-        if (!invoiceId || FIRED.has(invoiceId)) return;
+        if (!invoiceId || firedHas(invoiceId)) return;
         // авторитетна перевірка статусу у Monobank
         const st = await monoStatus(invoiceId);
         const status = (st && st.status) || data.status;
         if (status !== 'success') { console.log('webhook status not success:', status); return; }
-        FIRED.add(invoiceId);
+        firedAdd(invoiceId);
         // ORDERS промах (рестарт контейнера) → реконструюємо з Monobank invoice,
         // а НЕ підставляємо фейкові 'std'/'bot'. reference = bot-{niche}-{ts}.
         let order = ORDERS.get(invoiceId);
